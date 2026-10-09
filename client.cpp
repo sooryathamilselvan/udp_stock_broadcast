@@ -5,66 +5,68 @@
 #include <sstream>
 #include <vector>
 #include <csignal>
+#include <stdexcept>
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
 using namespace std;
 
-// Configuration
-const char* MULTICAST_IP = "239.255.0.1";
-const int PORT = 5000;
-
 volatile sig_atomic_t running = 1;
 
-void handleInterrupt(int signal) {
+void handleInterrupt(int) {
     running = 0;
 }
 
-int main() {
-    signal(SIGINT, handleInterrupt);
+int main(int argc, char* argv[]) {
+    string multicastIP = "239.255.0.1";
+    int port = 5000;
 
-    // Initialize Winsock
+    try {
+        if (argc > 3) {
+            cerr << "Usage: client.exe [multicast_ip] [port]\n";
+            return 1;
+        }
+
+        if (argc > 1) multicastIP = argv[1];
+        if (argc > 2) port = stoi(argv[2]);
+    } catch (...) {
+        cerr << "Invalid port argument.\n";
+        return 1;
+    }
+
+    if (port < 1 || port > 65535) {
+        cerr << "Port must be between 1 and 65535.\n";
+        return 1;
+    }
+
     WSADATA wsaData;
-
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         cerr << "Winsock initialization failed.\n";
         return 1;
     }
 
-    // Create UDP socket
-    SOCKET clientSocket = socket(
-        AF_INET, SOCK_DGRAM, IPPROTO_UDP
-    );
-
+    SOCKET clientSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (clientSocket == INVALID_SOCKET) {
-        cerr << "Socket creation failed: "
-             << WSAGetLastError() << '\n';
+        cerr << "Socket creation failed: " << WSAGetLastError() << '\n';
         WSACleanup();
         return 1;
     }
 
-    // Allow multiple clients to share the UDP port
     BOOL reuse = TRUE;
-
-    if (setsockopt(
-            clientSocket, SOL_SOCKET, SO_REUSEADDR,
-            reinterpret_cast<const char*>(&reuse),
-            sizeof(reuse)) == SOCKET_ERROR) {
-        cerr << "Socket option failed: "
-             << WSAGetLastError() << '\n';
+    if (setsockopt(clientSocket, SOL_SOCKET, SO_REUSEADDR,
+                   reinterpret_cast<const char*>(&reuse),
+                   sizeof(reuse)) == SOCKET_ERROR) {
+        cerr << "Socket option failed: " << WSAGetLastError() << '\n';
         closesocket(clientSocket);
         WSACleanup();
         return 1;
     }
 
-    // Set receive timeout to 500 milliseconds
     DWORD timeoutMs = 500;
-
-    if (setsockopt(
-            clientSocket, SOL_SOCKET, SO_RCVTIMEO,
-            reinterpret_cast<const char*>(&timeoutMs),
-            sizeof(timeoutMs)) == SOCKET_ERROR) {
+    if (setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&timeoutMs),
+                   sizeof(timeoutMs)) == SOCKET_ERROR) {
         cerr << "Receive timeout setup failed: "
              << WSAGetLastError() << '\n';
         closesocket(clientSocket);
@@ -72,43 +74,36 @@ int main() {
         return 1;
     }
 
-    // Bind to the UDP port
     sockaddr_in localAddress{};
-
     localAddress.sin_family = AF_INET;
-    localAddress.sin_port = htons(PORT);
+    localAddress.sin_port = htons(static_cast<u_short>(port));
     localAddress.sin_addr.s_addr = htonl(INADDR_ANY);
 
-    if (bind(
-            clientSocket,
-            reinterpret_cast<sockaddr*>(&localAddress),
-            sizeof(localAddress)) == SOCKET_ERROR) {
-        cerr << "Bind failed: "
-             << WSAGetLastError() << '\n';
+    if (bind(clientSocket,
+             reinterpret_cast<sockaddr*>(&localAddress),
+             sizeof(localAddress)) == SOCKET_ERROR) {
+        cerr << "Bind failed: " << WSAGetLastError() << '\n';
         closesocket(clientSocket);
         WSACleanup();
         return 1;
     }
 
-    // Join multicast group
     ip_mreq multicastRequest{};
 
-    if (inet_pton(
-            AF_INET, MULTICAST_IP,
-            &multicastRequest.imr_multiaddr) != 1) {
-        cerr << "Invalid multicast IP address.\n";
+    if (inet_pton(AF_INET, multicastIP.c_str(),
+                  &multicastRequest.imr_multiaddr) != 1 ||
+        !IN_MULTICAST(ntohl(multicastRequest.imr_multiaddr.s_addr))) {
+        cerr << "Invalid IPv4 multicast address.\n";
         closesocket(clientSocket);
         WSACleanup();
         return 1;
     }
 
-    multicastRequest.imr_interface.s_addr =
-        htonl(INADDR_ANY);
+    multicastRequest.imr_interface.s_addr = htonl(INADDR_ANY);
 
-    if (setsockopt(
-            clientSocket, IPPROTO_IP, IP_ADD_MEMBERSHIP,
-            reinterpret_cast<const char*>(&multicastRequest),
-            sizeof(multicastRequest)) == SOCKET_ERROR) {
+    if (setsockopt(clientSocket, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                   reinterpret_cast<const char*>(&multicastRequest),
+                   sizeof(multicastRequest)) == SOCKET_ERROR) {
         cerr << "Joining multicast group failed: "
              << WSAGetLastError() << '\n';
         closesocket(clientSocket);
@@ -116,11 +111,13 @@ int main() {
         return 1;
     }
 
-    cout << "=== UDP Stock Price Client ===\n";
-    cout << "Multicast group: " << MULTICAST_IP << '\n';
-    cout << "UDP port: " << PORT << '\n';
-    cout << "Waiting for stock updates...\n";
-    cout << "Press Ctrl+C to stop.\n";
+    signal(SIGINT, handleInterrupt);
+
+    cout << "=== UDP Stock Price Client ===\n"
+         << "Multicast IP: " << multicastIP << '\n'
+         << "UDP port: " << port << '\n'
+         << "Waiting for stock updates...\n"
+         << "Press Ctrl+C to stop.\n";
 
     char buffer[2048];
 
@@ -128,16 +125,13 @@ int main() {
         sockaddr_in senderAddress{};
         int senderLength = sizeof(senderAddress);
 
-        int bytesReceived = recvfrom(
-            clientSocket,
-            buffer,
-            sizeof(buffer) - 1,
-            0,
+        int received = recvfrom(
+            clientSocket, buffer, sizeof(buffer) - 1, 0,
             reinterpret_cast<sockaddr*>(&senderAddress),
             &senderLength
         );
 
-        if (bytesReceived == SOCKET_ERROR) {
+        if (received == SOCKET_ERROR) {
             int error = WSAGetLastError();
 
             if (error == WSAETIMEDOUT ||
@@ -151,105 +145,127 @@ int main() {
             break;
         }
 
-        buffer[bytesReceived] = '\0';
+        buffer[received] = '\0';
         string message(buffer);
 
-        // Extract timestamp
-        size_t timestampStart =
-            message.find("\"timestamp\":\"");
+        // Extract timestamp from the server's JSON message.
+        const string timestampKey = "\"timestamp\":\"";
+        size_t tsStart = message.find(timestampKey);
 
-        if (timestampStart == string::npos) {
+        if (tsStart == string::npos) {
             cerr << "Invalid message: timestamp missing.\n";
             continue;
         }
 
-        timestampStart += string("\"timestamp\":\"").length();
+        tsStart += timestampKey.size();
+        size_t tsEnd = message.find('"', tsStart);
 
-        size_t timestampEnd =
-            message.find('"', timestampStart);
-
-        if (timestampEnd == string::npos) {
-            cerr << "Invalid timestamp format.\n";
+        if (tsEnd == string::npos) {
+            cerr << "Invalid timestamp.\n";
             continue;
         }
 
-        string timestamp = message.substr(
-            timestampStart,
-            timestampEnd - timestampStart
-        );
+        string timestamp = message.substr(tsStart, tsEnd - tsStart);
 
-        // Extract stock section
-        size_t stocksStart = message.find("\"stocks\":{");
+        // Extract the stock object.
+        const string stocksKey = "\"stocks\":{";
+        size_t dataStart = message.find(stocksKey);
 
-        if (stocksStart == string::npos) {
+        if (dataStart == string::npos) {
             cerr << "Invalid message: stocks missing.\n";
             continue;
         }
 
-        stocksStart += string("\"stocks\":{").length();
+        dataStart += stocksKey.size();
+        size_t dataEnd = message.find('}', dataStart);
 
-        size_t stocksEnd = message.find('}', stocksStart);
-
-        if (stocksEnd == string::npos) {
-            cerr << "Invalid stock data format.\n";
+        if (dataEnd == string::npos) {
+            cerr << "Invalid stock data.\n";
             continue;
         }
 
         string stockData = message.substr(
-            stocksStart, stocksEnd - stocksStart
+            dataStart, dataEnd - dataStart
         );
 
         vector<pair<string, double>> stocks;
-        stringstream dataStream(stockData);
+        stringstream stream(stockData);
         string item;
+        bool valid = true;
 
-        while (getline(dataStream, item, ',')) {
+        while (getline(stream, item, ',')) {
             size_t colon = item.find(':');
             size_t nameStart = item.find('"');
 
             if (colon == string::npos ||
                 nameStart == string::npos) {
-                continue;
+                valid = false;
+                break;
             }
 
             size_t nameEnd = item.find('"', nameStart + 1);
 
             if (nameEnd == string::npos || nameEnd > colon) {
-                continue;
+                valid = false;
+                break;
             }
 
             string symbol = item.substr(
-                nameStart + 1,
-                nameEnd - nameStart - 1
+                nameStart + 1, nameEnd - nameStart - 1
             );
 
             try {
-                size_t parsedLength = 0;
                 string priceText = item.substr(colon + 1);
-
+                size_t parsedLength = 0;
                 double price = stod(priceText, &parsedLength);
 
-                if (parsedLength != priceText.size()) {
-                    continue;
+                if (parsedLength != priceText.size() ||
+                    price < 0) {
+                    valid = false;
+                    break;
                 }
 
                 stocks.push_back({symbol, price});
-            } catch (const exception&) {
-                cerr << "Invalid price received.\n";
+            } catch (...) {
+                valid = false;
+                break;
             }
         }
 
-        if (stocks.size() != 5) {
-            cerr << "Incomplete stock update received.\n";
+        // Ensure all five expected symbols appear exactly once.
+        const vector<string> expected = {
+            "SBI", "KOTAK", "63MOONS",
+            "TATASTEEL", "TATACOFFEE"
+        };
+
+        if (!valid || stocks.size() != expected.size()) {
+            cerr << "Invalid or incomplete stock update.\n";
             continue;
         }
 
-        // Display received update
-        cout << "\nLast received update: " << timestamp << '\n';
+        for (const string& symbol : expected) {
+            int count = 0;
 
+            for (const auto& stock : stocks) {
+                if (stock.first == symbol) {
+                    ++count;
+                }
+            }
+
+            if (count != 1) {
+                valid = false;
+                break;
+            }
+        }
+
+        if (!valid) {
+            cerr << "Stock symbols are missing or duplicated.\n";
+            continue;
+        }
+
+        cout << "\nLast received update: " << timestamp << '\n';
         cout << left << setw(15) << "Stock"
              << right << setw(15) << "LTP (INR)" << '\n';
-
         cout << string(30, '-') << '\n';
 
         for (const auto& stock : stocks) {
@@ -259,19 +275,15 @@ int main() {
         }
     }
 
-    // Leave multicast group
-    if (setsockopt(
-            clientSocket, IPPROTO_IP, IP_DROP_MEMBERSHIP,
-            reinterpret_cast<const char*>(&multicastRequest),
-            sizeof(multicastRequest)) == SOCKET_ERROR) {
+    if (setsockopt(clientSocket, IPPROTO_IP, IP_DROP_MEMBERSHIP,
+                   reinterpret_cast<const char*>(&multicastRequest),
+                   sizeof(multicastRequest)) == SOCKET_ERROR) {
         cerr << "Warning: failed to leave multicast group.\n";
     }
 
-    // Release resources
     closesocket(clientSocket);
     WSACleanup();
 
     cout << "\nClient stopped successfully.\n";
-
     return 0;
 }
